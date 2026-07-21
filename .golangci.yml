@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Writes to our stdout/stderr seams and the terminal are best-effort;
+      # a failed diagnostic write should never fail the command.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

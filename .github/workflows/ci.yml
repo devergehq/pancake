@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        # v7+ installs golangci-lint v2, which the .golangci.yml schema targets.
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+      - name: test
+        # The integration tests drive real git repos, so a git identity must
+        # exist even though the harness also sets GIT_AUTHOR_*/COMMITTER_* env.
+        run: go test -race ./...

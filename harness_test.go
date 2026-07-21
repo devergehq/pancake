@@ -20,7 +20,9 @@ func TestMain(m *testing.M) {
 		"GIT_CONFIG_SYSTEM":   os.DevNull,
 	}
 	for k, v := range env {
-		os.Setenv(k, v)
+		if err := os.Setenv(k, v); err != nil {
+			panic(err)
+		}
 	}
 	os.Exit(m.Run())
 }
