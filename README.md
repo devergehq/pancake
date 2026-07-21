@@ -51,7 +51,21 @@ pancake log    <top> [trunk]   decorated graph of the stack
 pancake sync   <top> [trunk]   fetch+prune, restack onto trunk, move every ref
 pancake submit <top> [trunk]   force-push (--force-with-lease) every branch
 
-Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run
+Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --trace[=json]
+```
+
+### Seeing where the time goes
+
+pancake is a thin wrapper over git, so a slow run means a slow *git* command —
+and which one is wildly repo-dependent (history depth, remote ref count, whether
+a `commit-graph` exists, working-tree size, hooks). `--trace` times every git
+call and prints an end-of-run summary; `--trace=json` emits a machine-readable
+object. Set `GIT_TRACE2=1` alongside it to see git's own internal phases.
+
+```sh
+pancake sync feature/dev-67 --trace        # per-call timings + slowest phase
+pancake sync feature/dev-67 --trace=json    # structured, for collecting/diffing
+PANCAKE_TRACE=1 pancake sync feature/dev-67 # same, via env
 ```
 
 ### Typical loop, after the bottom PR merges

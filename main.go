@@ -11,6 +11,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -33,6 +35,131 @@ var (
 	stdout io.Writer = os.Stdout
 	stderr io.Writer = os.Stderr
 )
+
+// tr is the active tracer, or nil when tracing is off. It is package-level so
+// the bare git() helper (which takes no options) can feed it. Because pancake
+// is a thin wrapper over git, timing every git call is the whole story of where
+// a run's wall-clock goes — see DEV-244.
+var tr *tracer
+
+// traceCall is one recorded git invocation.
+type traceCall struct {
+	Cmd      string `json:"cmd"`
+	MS       int64  `json:"ms"`
+	OK       bool   `json:"ok"`
+	Mutating bool   `json:"mutating"`
+	Skipped  bool   `json:"skipped"` // gated out by --dry-run
+}
+
+// tracer collects per-git-command timings for a single pancake run.
+type tracer struct {
+	mode  string // "text" | "json"
+	calls []traceCall
+}
+
+// record logs one git invocation. In text mode it also streams a dim line so a
+// hang is visible as it happens; json mode stays silent until finish().
+func (t *tracer) record(args []string, d time.Duration, err error, mutating, skipped bool) {
+	if t == nil {
+		return
+	}
+	c := traceCall{
+		Cmd:      strings.Join(args, " "),
+		MS:       d.Milliseconds(),
+		OK:       err == nil,
+		Mutating: mutating,
+		Skipped:  skipped,
+	}
+	t.calls = append(t.calls, c)
+	if t.mode == "text" {
+		status := "ok"
+		switch {
+		case skipped:
+			status = "skip"
+		case err != nil:
+			status = "ERR"
+		}
+		fmt.Fprintf(stderr, "\033[2m  trace %7dms  %-4s  git %s\033[0m\n", c.MS, status, c.Cmd)
+	}
+}
+
+// stats aggregates the recorded calls: total wall-clock spent in git, the call
+// count, and the slowest git subcommand (by summed duration).
+func (t *tracer) stats() (total int64, count int, slowPhase string, slowMS int64) {
+	byPhase := map[string]int64{}
+	for _, c := range t.calls {
+		total += c.MS
+		phase := c.Cmd
+		if i := strings.IndexByte(phase, ' '); i > 0 {
+			phase = phase[:i]
+		}
+		byPhase[phase] += c.MS
+	}
+	slowMS = -1
+	for p, ms := range byPhase {
+		if ms > slowMS {
+			slowPhase, slowMS = p, ms
+		}
+	}
+	return total, len(t.calls), slowPhase, slowMS
+}
+
+// finish emits the end-of-run trace summary (to stderr, keeping stdout clean for
+// the command's real output). json mode emits one machine-readable object.
+func (t *tracer) finish() {
+	if t == nil {
+		return
+	}
+	total, count, slowPhase, slowMS := t.stats()
+	if t.mode == "json" {
+		obj := struct {
+			TotalMS int64       `json:"total_ms"`
+			Count   int         `json:"count"`
+			Slowest string      `json:"slowest_phase"`
+			SlowMS  int64       `json:"slowest_ms"`
+			Calls   []traceCall `json:"calls"`
+		}{total, count, slowPhase, slowMS, t.calls}
+		enc := json.NewEncoder(stderr)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(obj)
+		return
+	}
+	fmt.Fprintf(stderr, "\033[2mtrace summary: %d git calls, %dms total; slowest: %s (%dms)\033[0m\n",
+		count, total, slowPhase, slowMS)
+}
+
+// traceMode is a flag.Value so --trace works bare (text) or as --trace=json.
+type traceMode struct{ s string }
+
+func (m *traceMode) String() string { return m.s }
+func (m *traceMode) Set(v string) error {
+	switch v {
+	case "true", "", "text":
+		m.s = "text"
+	case "json":
+		m.s = "json"
+	default:
+		return fmt.Errorf("invalid --trace value %q (want: text or json)", v)
+	}
+	return nil
+}
+func (m *traceMode) IsBoolFlag() bool { return true }
+
+// resolveTraceMode picks the trace mode: an explicit flag wins, else the
+// PANCAKE_TRACE env var ("json" for json, any other non-empty value for text).
+func resolveTraceMode(flagVal, env string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	switch env {
+	case "":
+		return ""
+	case "json":
+		return "json"
+	default:
+		return "text"
+	}
+}
 
 type options struct {
 	trunk  string
@@ -62,7 +189,13 @@ func main() {
 	fs.StringVar(&o.trunk, "trunk", defaultTrunk, "trunk branch the stack targets")
 	fs.StringVar(&o.remote, "remote", defaultRemote, "remote name")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print mutating git commands instead of running them")
+	var traceOpt traceMode
+	fs.Var(&traceOpt, "trace", "trace git calls with timings (--trace or --trace=json)")
 	_ = fs.Parse(os.Args[2:])
+
+	if mode := resolveTraceMode(traceOpt.s, os.Getenv("PANCAKE_TRACE")); mode != "" {
+		tr = &tracer{mode: mode}
+	}
 
 	top := fs.Arg(0)
 	if top == "" {
@@ -85,6 +218,7 @@ func main() {
 	default:
 		fatal("unknown command %q (try: list, log, sync, submit)", cmd)
 	}
+	tr.finish()
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -92,7 +226,9 @@ func main() {
 
 // git runs a git command and returns its trimmed stdout.
 func git(args ...string) (string, error) {
+	start := time.Now()
 	out, err := exec.Command("git", args...).Output()
+	tr.record(args, time.Since(start), err, false, false)
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(ee.Stderr)))
@@ -107,11 +243,15 @@ func git(args ...string) (string, error) {
 func run(o options, mutating bool, args ...string) error {
 	if o.dryRun && mutating {
 		fmt.Fprintf(stderr, "DRY-RUN: git %s\n", strings.Join(args, " "))
+		tr.record(args, 0, nil, mutating, true)
 		return nil
 	}
 	cmd := exec.Command("git", args...)
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = stdout, stderr, os.Stdin
-	return cmd.Run()
+	start := time.Now()
+	err := cmd.Run()
+	tr.record(args, time.Since(start), err, mutating, false)
+	return err
 }
 
 func note(format string, a ...any) {
@@ -240,8 +380,12 @@ Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)
   --remote <name>  remote name (default origin)
   --dry-run        print mutating git commands instead of running them
+  --trace[=json]   time every git call; end-of-run summary (or PANCAKE_TRACE=1)
 
 <top> is a short branch name, e.g. feature/dev-67 (no remote prefix).
+
+Since pancake is a thin wrapper over git, --trace shows exactly where a run's
+time goes — set GIT_TRACE2=1 alongside it to see git's own internal phases.
 
 Typical loop after the bottom PR merges:
   pancake sync   feature/dev-67
