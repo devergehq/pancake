@@ -197,12 +197,17 @@ func main() {
 		tr = &tracer{mode: mode}
 	}
 
-	top := fs.Arg(0)
-	if top == "" {
-		fatal("missing <top> branch — usage: pancake %s [flags] <top> [trunk]", cmd)
-	}
 	if t := fs.Arg(1); t != "" { // optional positional trunk override
 		o.trunk = t
+	}
+	top := fs.Arg(0)
+	if top == "" { // no <top> given — infer the tip of the stack from the graph
+		detected, derr := detectTop(o)
+		if derr != nil {
+			fatal("%v", derr)
+		}
+		top = detected
+		note("auto-detected top branch: %s", top)
 	}
 
 	var err error
@@ -290,6 +295,80 @@ func stack(top string, o options) ([]branch, error) {
 	return bs, nil
 }
 
+// detectTop infers the top branch when the user omits it: among the remote
+// branches not merged into trunk, the "tip" of a stack is one that no other
+// such branch is built on top of. With a single stack there is exactly one tip.
+// With several independent stacks, it disambiguates by the current branch —
+// the tip whose stack contains HEAD — and otherwise asks the user to be
+// explicit rather than guessing.
+func detectTop(o options) (string, error) {
+	out, err := git("for-each-ref", "--no-merged", o.trunk,
+		"--format=%(refname:lstrip=3)", "refs/remotes/"+o.remote+"/")
+	if err != nil {
+		return "", err
+	}
+	var cands []string
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || l == "HEAD" { // skip the origin/HEAD symref
+			continue
+		}
+		cands = append(cands, l)
+	}
+	if len(cands) == 0 {
+		return "", fmt.Errorf("no branches above %s to infer a stack from — pass <top> explicitly", o.trunk)
+	}
+
+	// A candidate is a tip if no other candidate contains it.
+	var tips []string
+	for _, x := range cands {
+		isTip := true
+		for _, y := range cands {
+			if x != y && contains(o.remote+"/"+y, o.remote+"/"+x) {
+				isTip = false
+				break
+			}
+		}
+		if isTip {
+			tips = append(tips, x)
+		}
+	}
+	if len(tips) == 1 {
+		return tips[0], nil
+	}
+
+	// Multiple stacks: pick the one whose tip contains the current branch.
+	if cur, err := git("rev-parse", "--abbrev-ref", "HEAD"); err == nil && cur != "" && cur != "HEAD" {
+		var match []string
+		for _, tp := range tips {
+			if tp == cur || contains(o.remote+"/"+tp, o.remote+"/"+cur) {
+				match = append(match, tp)
+			}
+		}
+		if len(match) == 1 {
+			return match[0], nil
+		}
+	}
+	sort.Strings(tips)
+	return "", fmt.Errorf("multiple stacks found (%s) — pass <top> explicitly", strings.Join(tips, ", "))
+}
+
+// contains reports whether ref outer contains inner (inner is an ancestor of
+// outer). git merge-base --is-ancestor exits 1 for a plain "no", which is a
+// valid answer rather than a failure — so we record it as a successful probe in
+// the trace and reserve the ERR marker for genuine errors (exit >1).
+func contains(outer, inner string) bool {
+	args := []string{"merge-base", "--is-ancestor", inner, outer}
+	start := time.Now()
+	err := exec.Command("git", args...).Run()
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+		tr.record(args, time.Since(start), nil, false, false)
+		return false
+	}
+	tr.record(args, time.Since(start), err, false, false)
+	return err == nil
+}
+
 func cmdList(top string, o options) error {
 	bs, err := stack(top, o)
 	if err != nil {
@@ -371,10 +450,10 @@ func usage(code int) {
 Derives the whole stack from the git graph. No stored state, no server, no account.
 
 Usage:
-  pancake list   [flags] <top> [trunk]   print the stack, bottom -> top
-  pancake log    [flags] <top> [trunk]   decorated graph of the stack
-  pancake sync   [flags] <top> [trunk]   fetch+prune, restack onto trunk, move all refs
-  pancake submit [flags] <top> [trunk]   force-push (with lease) every branch in the stack
+  pancake list   [flags] [top] [trunk]   print the stack, bottom -> top
+  pancake log    [flags] [top] [trunk]   decorated graph of the stack
+  pancake sync   [flags] [top] [trunk]   fetch+prune, restack onto trunk, move all refs
+  pancake submit [flags] [top] [trunk]   force-push (with lease) every branch in the stack
 
 Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)
@@ -382,7 +461,8 @@ Flags (must precede positional args):
   --dry-run        print mutating git commands instead of running them
   --trace[=json]   time every git call; end-of-run summary (or PANCAKE_TRACE=1)
 
-<top> is a short branch name, e.g. feature/dev-67 (no remote prefix).
+<top> is a short branch name, e.g. feature/dev-67 (no remote prefix). Omit it to
+auto-detect the tip of your stack from the graph (the current branch's stack).
 
 Since pancake is a thin wrapper over git, --trace shows exactly where a run's
 time goes — set GIT_TRACE2=1 alongside it to see git's own internal phases.

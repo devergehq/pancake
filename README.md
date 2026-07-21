@@ -46,13 +46,17 @@ dropped — so you never have to tell it which branch merged.
 ## Commands
 
 ```
-pancake list   <top> [trunk]   print the stack, bottom -> top
-pancake log    <top> [trunk]   decorated graph of the stack
-pancake sync   <top> [trunk]   fetch+prune, restack onto trunk, move every ref
-pancake submit <top> [trunk]   force-push (--force-with-lease) every branch
+pancake list   [top] [trunk]   print the stack, bottom -> top
+pancake log    [top] [trunk]   decorated graph of the stack
+pancake sync   [top] [trunk]   fetch+prune, restack onto trunk, move every ref
+pancake submit [top] [trunk]   force-push (--force-with-lease) every branch
 
 Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --trace[=json]
 ```
+
+Omit `[top]` and pancake infers it: the tip of your stack (the unmerged branch
+nothing else is built on). With one stack that's unambiguous; with several it
+picks the one containing your current branch, else asks you to name it.
 
 ### Seeing where the time goes
 
