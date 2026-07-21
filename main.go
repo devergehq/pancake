@@ -407,8 +407,81 @@ func cmdList(top string, o options) error {
 	return nil
 }
 
+// prInfo is one open/closed pull request, as reported by gh.
+type prInfo struct {
+	Number int    `json:"number"`
+	State  string `json:"state"`
+	Base   string `json:"baseRefName"`
+	Head   string `json:"headRefName"`
+}
+
+// fetchPRs is a seam: production shells to gh; tests stub it so the PR-aware
+// path is exercised without a network or a real GitHub repo.
+var fetchPRs = ghFetchPRs
+
+// ghFetchPRs returns the repo's PRs keyed by head branch. A missing or
+// unauthenticated gh is reported as an error so callers can degrade gracefully.
+func ghFetchPRs(o options) (map[string]prInfo, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return nil, fmt.Errorf("gh not installed")
+	}
+	out, err := exec.Command("gh", "pr", "list", "--state", "all",
+		"--json", "number,state,baseRefName,headRefName", "--limit", "200").Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("gh: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, err
+	}
+	var arr []prInfo
+	if err := json.Unmarshal(out, &arr); err != nil {
+		return nil, err
+	}
+	m := make(map[string]prInfo, len(arr))
+	for _, p := range arr {
+		m[p.Head] = p
+	}
+	return m, nil
+}
+
 func cmdLog(top string, o options) error {
+	bs, err := stack(top, o)
+	if err != nil {
+		return err
+	}
+	if prs, prErr := fetchPRs(o); prErr != nil {
+		note("PR annotations unavailable (%v) — showing plain graph", prErr)
+	} else {
+		printPRTable(bs, o, prs)
+	}
 	return run(o, false, "log", "--graph", "--oneline", "--decorate", o.trunk+".."+o.remote+"/"+top)
+}
+
+// printPRTable lists the stack top → bottom with each branch's PR number, state,
+// and base — flagging any PR whose base is not the branch directly below it (the
+// bottom branch's base should be the trunk). That mismatch is the thing you most
+// want to catch: a stacked PR pointed at the wrong base.
+func printPRTable(bs []branch, o options, prs map[string]prInfo) {
+	trunkShort := strings.TrimPrefix(o.trunk, o.remote+"/")
+	fmt.Fprintln(stdout, "Stack PRs (top → bottom):")
+	for i := len(bs) - 1; i >= 0; i-- {
+		b := bs[i]
+		wantBase := trunkShort
+		if i > 0 {
+			wantBase = bs[i-1].name
+		}
+		pr, ok := prs[b.name]
+		if !ok {
+			fmt.Fprintf(stdout, "  %-28s (no PR)\n", b.name)
+			continue
+		}
+		mark := "✓"
+		if pr.Base != wantBase {
+			mark = "✗ base should be " + wantBase
+		}
+		fmt.Fprintf(stdout, "  %-28s #%-4d %-6s base %-24s %s\n", b.name, pr.Number, pr.State, pr.Base, mark)
+	}
+	fmt.Fprintln(stdout)
 }
 
 func cmdSync(top string, o options) error {
