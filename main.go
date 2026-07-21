@@ -13,6 +13,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -23,6 +24,14 @@ import (
 const (
 	defaultTrunk  = "origin/master"
 	defaultRemote = "origin"
+)
+
+// Output streams. These are package-level seams so tests can capture command
+// output and streamed git I/O without spawning a subprocess. Production uses
+// the real terminal streams; nothing else reassigns them.
+var (
+	stdout io.Writer = os.Stdout
+	stderr io.Writer = os.Stderr
 )
 
 type options struct {
@@ -97,16 +106,16 @@ func git(args ...string) (string, error) {
 // it prints the command instead of executing it.
 func run(o options, mutating bool, args ...string) error {
 	if o.dryRun && mutating {
-		fmt.Fprintf(os.Stderr, "DRY-RUN: git %s\n", strings.Join(args, " "))
+		fmt.Fprintf(stderr, "DRY-RUN: git %s\n", strings.Join(args, " "))
 		return nil
 	}
 	cmd := exec.Command("git", args...)
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = stdout, stderr, os.Stdin
 	return cmd.Run()
 }
 
 func note(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "\033[36m▸ %s\033[0m\n", fmt.Sprintf(format, a...))
+	fmt.Fprintf(stderr, "\033[36m▸ %s\033[0m\n", fmt.Sprintf(format, a...))
 }
 
 // stack derives the branches of the stack topped by top, ordered bottom -> top.
@@ -147,7 +156,7 @@ func cmdList(top string, o options) error {
 		return err
 	}
 	for _, b := range bs {
-		fmt.Println(b.name)
+		fmt.Fprintln(stdout, b.name)
 	}
 	return nil
 }
@@ -212,12 +221,12 @@ func cmdSubmit(top string, o options) error {
 }
 
 func fatal(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "pancake: "+format+"\n", a...)
+	fmt.Fprintf(stderr, "pancake: "+format+"\n", a...)
 	os.Exit(1)
 }
 
 func usage(code int) {
-	fmt.Fprint(os.Stderr, `pancake — stateless stacked-PR manager
+	fmt.Fprint(stderr, `pancake — stateless stacked-PR manager
 
 Derives the whole stack from the git graph. No stored state, no server, no account.
 
