@@ -162,16 +162,26 @@ func resolveTraceMode(flagVal, env string) string {
 }
 
 type options struct {
-	trunk  string
-	remote string
-	dryRun bool
+	trunk   string
+	remote  string
+	dryRun  bool
+	jsonOut bool
 }
 
 // branch is one member of the stack.
 type branch struct {
-	name  string // short name, e.g. feature/dev-67
-	sha   string
-	depth int // commits between trunk and this branch's tip (for ordering)
+	name    string // short name, e.g. feature/dev-67
+	sha     string
+	depth   int    // commits between trunk and this branch's tip (for ordering)
+	subject string // subject line of the branch tip commit
+}
+
+// branchJSON is the machine-readable projection emitted by `list --json`.
+type branchJSON struct {
+	Branch            string `json:"branch"`
+	SHA               string `json:"sha"`
+	CommitsAboveTrunk int    `json:"commitsAboveTrunk"`
+	Subject           string `json:"subject"`
 }
 
 func main() {
@@ -189,6 +199,7 @@ func main() {
 	fs.StringVar(&o.trunk, "trunk", defaultTrunk, "trunk branch the stack targets")
 	fs.StringVar(&o.remote, "remote", defaultRemote, "remote name")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print mutating git commands instead of running them")
+	fs.BoolVar(&o.jsonOut, "json", false, "list: emit the stack as JSON")
 	var traceOpt traceMode
 	fs.Var(&traceOpt, "trace", "trace git calls with timings (--trace or --trace=json)")
 	_ = fs.Parse(os.Args[2:])
@@ -269,10 +280,12 @@ func stack(top string, o options) ([]branch, error) {
 	if _, err := git("rev-parse", "--verify", "--quiet", ref); err != nil {
 		return nil, fmt.Errorf("no remote-tracking branch %q — run a fetch, or check the name", ref)
 	}
+	// Tab-delimited so the commit subject (which may contain spaces) parses
+	// cleanly. sha and refname never contain tabs.
 	out, err := git("for-each-ref",
 		"--merged", ref,
 		"--no-merged", o.trunk,
-		"--format=%(objectname) %(refname:lstrip=3)",
+		"--format=%(objectname)%09%(refname:lstrip=3)%09%(contents:subject)",
 		"refs/remotes/"+o.remote+"/")
 	if err != nil {
 		return nil, err
@@ -282,14 +295,18 @@ func stack(top string, o options) ([]branch, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
 			continue
 		}
 		sha, name := parts[0], parts[1]
+		subject := ""
+		if len(parts) == 3 {
+			subject = parts[2]
+		}
 		cnt, _ := git("rev-list", "--count", o.trunk+".."+sha)
 		depth, _ := strconv.Atoi(cnt)
-		bs = append(bs, branch{name: name, sha: sha, depth: depth})
+		bs = append(bs, branch{name: name, sha: sha, depth: depth, subject: subject})
 	}
 	sort.SliceStable(bs, func(i, j int) bool { return bs[i].depth < bs[j].depth })
 	return bs, nil
@@ -373,6 +390,16 @@ func cmdList(top string, o options) error {
 	bs, err := stack(top, o)
 	if err != nil {
 		return err
+	}
+	if o.jsonOut {
+		out := make([]branchJSON, len(bs))
+		for i, b := range bs {
+			out[i] = branchJSON{Branch: b.name, SHA: b.sha, CommitsAboveTrunk: b.depth, Subject: b.subject}
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
 	}
 	for _, b := range bs {
 		fmt.Fprintln(stdout, b.name)
@@ -459,6 +486,7 @@ Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)
   --remote <name>  remote name (default origin)
   --dry-run        print mutating git commands instead of running them
+  --json           list: emit the stack as JSON [{branch,sha,commitsAboveTrunk,subject}]
   --trace[=json]   time every git call; end-of-run summary (or PANCAKE_TRACE=1)
 
 <top> is a short branch name, e.g. feature/dev-67 (no remote prefix). Omit it to

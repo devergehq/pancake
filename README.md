@@ -51,8 +51,11 @@ pancake log    [top] [trunk]   decorated graph of the stack
 pancake sync   [top] [trunk]   fetch+prune, restack onto trunk, move every ref
 pancake submit [top] [trunk]   force-push (--force-with-lease) every branch
 
-Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --trace[=json]
+Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --json  --trace[=json]
 ```
+
+`list --json` emits `[{branch, sha, commitsAboveTrunk, subject}]`, ordered
+bottom → top — for scripting and for piping into other tools.
 
 Omit `[top]` and pancake infers it: the tip of your stack (the unmerged branch
 nothing else is built on). With one stack that's unambiguous; with several it
