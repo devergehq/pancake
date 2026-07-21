@@ -18,6 +18,11 @@
 #   <top>   short branch name, e.g. feature/dev-67  (no "origin/" prefix)
 #   <trunk> defaults to origin/master
 #
+# sync options:
+#   --from <ref>   start the restack from <ref> instead of auto-detecting the
+#                  boundary. Escape hatch for when a squash-merged branch's local
+#                  ref is gone (e.g. a fresh clone): pass its pre-merge tip.
+#
 # Typical loop after a PR at the bottom merges:
 #   git stack sync   feature/dev-67
 #   git stack submit feature/dev-67
@@ -30,7 +35,7 @@ die() { printf 'git-stack: %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[36m▸ %s\033[0m\n' "$*" >&2; }
 
 usage() {
-  sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -52,6 +57,18 @@ cmd="${1:-}"; [ -n "$cmd" ] || usage 1
 case "$cmd" in -h|--help|help) usage 0 ;; esac
 shift
 
+# Optional flags (currently just --from: an explicit rebase boundary for `sync`).
+from=""
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from)   from="${2:?--from needs a <ref>}"; shift 2 ;;
+    --from=*) from="${1#--from=}"; shift ;;
+    *)        positional+=("$1"); shift ;;
+  esac
+done
+set -- "${positional[@]}"
+
 top="${1:-}"; [ -n "$top" ] || die "missing <top> branch (try: git stack $cmd feature/xxx)"
 trunk="${2:-$TRUNK_DEFAULT}"
 
@@ -67,18 +84,59 @@ case "$cmd" in
   sync)
     note "fetching + pruning origin"
     git fetch --prune origin
+    # Check out the top branch in THIS worktree first (DWIM-creates a tracking
+    # branch if it doesn't exist locally yet).
+    git switch "$top" 2>/dev/null || git switch -c "$top" --track "origin/$top" \
+      || die "can't switch to '$top' — is it checked out in another worktree?"
     note "materializing stack branches locally"
     stack_list "$top" "$trunk" | while read -r b; do
-      git branch --force "$b" "origin/$b"
-      printf '   %s -> %s\n' "$b" "$(git rev-parse --short "origin/$b")" >&2
+      # The top is HEAD — it gets rebased below, so never force-update it (git
+      # refuses to force a checked-out branch). Skip it here.
+      [ "$b" = "$top" ] && continue
+      # A branch checked out in *another* worktree also can't be force-updated;
+      # skip it with a warning rather than aborting the whole sync.
+      if git branch --force "$b" "origin/$b" 2>/dev/null; then
+        printf '   %s -> %s\n' "$b" "$(git rev-parse --short "origin/$b")" >&2
+      else
+        printf '   ! skipped %s (checked out in another worktree — align it there)\n' "$b" >&2
+      fi
     done
-    git switch "$top"
-    # Replay from the fork point onto the new trunk. Anything already contained
-    # in trunk (whatever just merged) replays empty and is dropped — so we never
-    # have to name the merged branch. --update-refs carries every local branch.
-    note "restacking $top onto $trunk (--update-refs)"
-    git rebase --update-refs --onto "$trunk" "$(git merge-base "$trunk" "$top")"
-    note "done — review with: git stack log $top"
+    # Work out where to start the replay.
+    #
+    # Normally it's the fork point (merge-base with trunk): everything above the
+    # fork replays onto the new trunk, and a single squash-merged commit already
+    # in trunk drops as an empty replay.
+    #
+    # But a *multi-commit* branch that was squash-merged and then deleted upstream
+    # collapses to one commit in trunk, so replaying its individual commits
+    # conflicts (add/add on files it created). Git left its LOCAL ref behind while
+    # pruning the remote — that local tip is exactly the boundary we want. So:
+    # find local branches that (a) have no remote counterpart (merged & deleted)
+    # and (b) are ancestors of HEAD (part of this stack), and start the replay
+    # from the HIGHEST one, skipping the merged commits entirely.
+    #
+    # Escape hatch: if --from is given, trust it and skip auto-detection. Use this
+    # when the merged branch's local ref is gone (e.g. a fresh clone) — pass the
+    # tip of the squash-merged branch (a SHA, or grab it off the merged PR).
+    if [ -n "$from" ]; then
+      boundary="$(git rev-parse --verify "${from}^{commit}" 2>/dev/null)" \
+        || die "--from: '$from' is not a valid commit/ref"
+      note "using explicit boundary --from $from ($(git rev-parse --short "$boundary"))"
+    else
+      boundary="$(git merge-base "$trunk" HEAD)"
+      for lb in $(git for-each-ref --format='%(refname:lstrip=2)' refs/heads/); do
+        [ "$lb" = "$top" ] && continue
+        git show-ref -q --verify "refs/remotes/origin/$lb" && continue   # still on the remote
+        git merge-base --is-ancestor "$lb" HEAD || continue              # not part of this stack
+        if git merge-base --is-ancestor "$boundary" "$lb"; then          # higher than current boundary
+          boundary="$(git rev-parse "$lb")"
+          note "squash-merged branch below the stack: $lb — dropping its commits"
+        fi
+      done
+    fi
+    note "restacking $top onto $trunk from $(git rev-parse --short "$boundary") (--update-refs)"
+    git rebase --update-refs --onto "$trunk" "$boundary"
+    note "done — review with: git stack log $top, then push: git stack submit $top"
     ;;
 
   submit)
