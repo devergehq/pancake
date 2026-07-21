@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# git-stack — stateless stacked-PR management, derived from the git graph.
+#
+# No stored state, no config, no server, no account. The "stack" is derived
+# every time from reachability in the commit graph, so it works identically in
+# any clone — including throwaway APFS workspaces — from the first second.
+#
+# You provide two things you already know: the TOP branch of the stack and the
+# TRUNK it targets (default origin/master). Everything else is computed.
+#
+# Usage:
+#   git stack list   <top> [trunk]    # print the stack, bottom -> top
+#   git stack log    <top> [trunk]    # show the stack as a decorated graph
+#   git stack sync   <top> [trunk]    # fetch+prune, restack onto trunk, move every local ref
+#   git stack submit <top> [trunk]    # force-push (with lease) every branch in the stack
+#
+#   <top>   short branch name, e.g. feature/dev-67  (no "origin/" prefix)
+#   <trunk> defaults to origin/master
+#
+# Typical loop after a PR at the bottom merges:
+#   git stack sync   feature/dev-67
+#   git stack submit feature/dev-67
+#
+set -euo pipefail
+
+TRUNK_DEFAULT="origin/master"
+
+die() { printf 'git-stack: %s\n' "$*" >&2; exit 1; }
+note() { printf '\033[36m▸ %s\033[0m\n' "$*" >&2; }
+
+usage() {
+  sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# Print every origin branch reachable from <top> but NOT from <trunk>, ordered
+# bottom -> top by distance from trunk. This IS the stack — merged branches are
+# gone from origin/* after fetch --prune, so they never appear.
+stack_list() {
+  local top="origin/$1" trunk="${2:-$TRUNK_DEFAULT}"
+  git rev-parse --verify -q "$top" >/dev/null \
+    || die "no remote-tracking branch '$top' — run a fetch, or check the name"
+  git for-each-ref --merged "$top" --no-merged "$trunk" \
+      --format='%(objectname) %(refname:lstrip=3)' refs/remotes/origin/ \
+    | while read -r sha name; do
+        printf '%s\t%s\n' "$(git rev-list --count "$trunk..$sha")" "$name"
+      done | sort -n | cut -f2
+}
+
+cmd="${1:-}"; [ -n "$cmd" ] || usage 1
+case "$cmd" in -h|--help|help) usage 0 ;; esac
+shift
+
+top="${1:-}"; [ -n "$top" ] || die "missing <top> branch (try: git stack $cmd feature/xxx)"
+trunk="${2:-$TRUNK_DEFAULT}"
+
+case "$cmd" in
+  list)
+    stack_list "$top" "$trunk"
+    ;;
+
+  log)
+    git log --graph --oneline --decorate "$trunk..origin/$top"
+    ;;
+
+  sync)
+    note "fetching + pruning origin"
+    git fetch --prune origin
+    note "materializing stack branches locally"
+    stack_list "$top" "$trunk" | while read -r b; do
+      git branch --force "$b" "origin/$b"
+      printf '   %s -> %s\n' "$b" "$(git rev-parse --short "origin/$b")" >&2
+    done
+    git switch "$top"
+    # Replay from the fork point onto the new trunk. Anything already contained
+    # in trunk (whatever just merged) replays empty and is dropped — so we never
+    # have to name the merged branch. --update-refs carries every local branch.
+    note "restacking $top onto $trunk (--update-refs)"
+    git rebase --update-refs --onto "$trunk" "$(git merge-base "$trunk" "$top")"
+    note "done — review with: git stack log $top"
+    ;;
+
+  submit)
+    # shellcheck disable=SC2046  # branch names never contain whitespace
+    branches=$(stack_list "$top" "$trunk")
+    [ -n "$branches" ] || die "no stack branches found above $trunk"
+    note "force-pushing: $(echo "$branches" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    git push --force-with-lease origin $branches
+    ;;
+
+  *)
+    die "unknown command '$cmd' (try: list, log, sync, submit)"
+    ;;
+esac

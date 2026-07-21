@@ -1,0 +1,8 @@
+# Binaries
+/pancake
+/dist/
+*.exe
+
+# Go
+*.test
+*.out
