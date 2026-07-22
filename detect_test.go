@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -49,8 +50,10 @@ func TestDetectTopDisambiguatesByCurrentBranch(t *testing.T) {
 }
 
 // Multiple stacks with HEAD on trunk (contained in all of them) is ambiguous —
-// detect refuses to guess and names the tips.
-func TestDetectTopAmbiguousErrors(t *testing.T) {
+// Detection is anchored on the current branch, so sitting on the trunk (with no
+// stack branch checked out) can't be resolved — it errors clearly instead of
+// guessing among unrelated stacks.
+func TestDetectTopOnTrunkErrors(t *testing.T) {
 	r := newRepo(t)
 	r.buildStack()
 	r.secondStack()
@@ -59,12 +62,43 @@ func TestDetectTopAmbiguousErrors(t *testing.T) {
 
 	_, err := detectTop(opts())
 	if err == nil {
-		t.Fatal("expected ambiguity error on trunk, got nil")
+		t.Fatal("expected an error when on the trunk, got nil")
 	}
-	for _, tip := range []string{"feature/c", "feature/x"} {
-		if !strings.Contains(err.Error(), tip) {
-			t.Errorf("error should name %q: %v", tip, err)
+	if !strings.Contains(err.Error(), "trunk") {
+		t.Errorf("error should mention the trunk: %v", err)
+	}
+}
+
+// The whole point of DEV-245: detection must scale with the stack, not the repo.
+// With many unrelated branches present, the number of merge-base subprocesses
+// must stay bounded by the stack size — not fan out across every ref.
+func TestDetectTopScalesWithStackNotRepo(t *testing.T) {
+	r := newRepo(t)
+	r.buildStack() // master <- a <- b <- c
+	for i := 0; i < 40; i++ {
+		r.switchTo("master")
+		name := fmt.Sprintf("noise/b%02d", i)
+		r.switchNew(name)
+		r.writeCommit(fmt.Sprintf("noise%02d.txt", i), "x", "noise "+name)
+		r.git("push", "origin", name)
+	}
+	r.switchTo("feature/b") // mid-stack, so the tip search actually runs
+	t.Chdir(r.dir)
+
+	tc := enableTrace(t, "text")
+	capture(t)
+	top, err := detectTop(opts())
+	if err != nil || top != "feature/c" {
+		t.Fatalf("detectTop = %q, %v; want feature/c", top, err)
+	}
+	mb := 0
+	for _, c := range tc.calls {
+		if strings.HasPrefix(c.Cmd, "merge-base") {
+			mb++
 		}
+	}
+	if mb > 6 {
+		t.Errorf("detectTop made %d merge-base calls with 40+ noise branches; must be bounded by stack size", mb)
 	}
 }
 
