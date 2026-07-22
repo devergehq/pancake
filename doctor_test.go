@@ -12,6 +12,15 @@ func stubRepoConfig(t *testing.T, cfg repoConfig, err error) {
 	t.Cleanup(func() { fetchRepoConfig = prev })
 }
 
+// setTrunkContext overrides the package-level trunk source/config for a test and
+// restores them on cleanup (these are read by doctor).
+func setTrunkContext(t *testing.T, source string, fc fileConfig) {
+	t.Helper()
+	ps, pc := trunkSource, localConfig
+	trunkSource, localConfig = source, fc
+	t.Cleanup(func() { trunkSource, localConfig = ps, pc })
+}
+
 func goodConfig() repoConfig {
 	return repoConfig{NameWithOwner: "acme/widget", DeleteBranchOnMerge: true, DefaultBranch: "master"}
 }
@@ -62,17 +71,40 @@ func TestDoctorFixEnablesSetting(t *testing.T) {
 	}
 }
 
-func TestDoctorTrunkMismatch(t *testing.T) {
+// The trap: pancake fell back to its built-in default, but the repo's default
+// branch differs. doctor must flag this (silent wrong target).
+func TestDoctorTrunkTrapWhenDefaulted(t *testing.T) {
+	setTrunkContext(t, "default", fileConfig{})
 	cfg := goodConfig()
-	cfg.DefaultBranch = "main" // repo default is main, but trunk is origin/master
+	cfg.DefaultBranch = "main" // repo default is main, but pancake defaulted to master
 	stubRepoConfig(t, cfg, nil)
 
 	out, _ := capture(t)
 	if err := cmdDoctor(opts()); err == nil {
-		t.Fatal("doctor should flag a trunk/default-branch mismatch")
+		t.Fatal("doctor should flag pancake defaulting to the wrong trunk")
 	}
-	if !strings.Contains(out.String(), "default=main") {
-		t.Errorf("expected the mismatch detail:\n%s", out.String())
+	s := out.String()
+	if !strings.Contains(s, "repo default is main") || !strings.Contains(s, ".pancake") {
+		t.Errorf("expected an actionable trap message:\n%s", s)
+	}
+}
+
+// An intentional override (trunk set via .pancake or --trunk) that differs from
+// the repo default is NOT an error — doctor reports it as intentional.
+func TestDoctorTrunkIntentionalOverride(t *testing.T) {
+	setTrunkContext(t, "config", fileConfig{trunk: "origin/dev", path: ".pancake"})
+	cfg := goodConfig()
+	cfg.DefaultBranch = "master" // repo default master, but we deliberately target dev
+	stubRepoConfig(t, cfg, nil)
+
+	o := opts()
+	o.trunk = "origin/dev"
+	out, _ := capture(t)
+	if err := cmdDoctor(o); err != nil {
+		t.Fatalf("intentional override should not fail: %v", err)
+	}
+	if !strings.Contains(out.String(), "intentional") {
+		t.Errorf("expected the override to be reported as intentional:\n%s", out.String())
 	}
 }
 
