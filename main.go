@@ -505,14 +505,24 @@ func cmdSync(top string, o options) error {
 	if len(bs) == 0 {
 		return fmt.Errorf("no stack branches found above %s", o.trunk)
 	}
-	note("materializing %d stack branches locally", len(bs))
-	for _, b := range bs {
-		if err := run(o, true, "branch", "--force", b.name, o.remote+"/"+b.name); err != nil {
-			return err
-		}
-	}
+	// Check out the top branch in THIS worktree first (DWIM-creates the tracking
+	// branch in a fresh clone). It becomes HEAD and is rebased below, so it must
+	// never be force-updated in the loop — git refuses to move a checked-out
+	// branch's ref. Doing this up front also means a sync started from anywhere
+	// (trunk, mid-stack, or the tip) proceeds identically.
 	if err := run(o, true, "switch", top); err != nil {
 		return err
+	}
+	note("materializing %d stack branches locally", len(bs))
+	for _, b := range bs {
+		if b.name == top {
+			continue // HEAD — rebased below, never force-updated
+		}
+		// A branch checked out in another worktree also can't be force-updated;
+		// warn and skip it rather than aborting the whole sync.
+		if err := run(o, true, "branch", "--force", b.name, o.remote+"/"+b.name); err != nil {
+			note("! skipped %s (checked out in another worktree — align it there)", b.name)
+		}
 	}
 	// Fork point on the (remote) top so it works even under --dry-run.
 	fork, err := git("merge-base", o.trunk, o.remote+"/"+top)
