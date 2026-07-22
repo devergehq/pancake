@@ -51,6 +51,7 @@ pancake log    [top] [trunk]   PR-aware stack (via gh) + decorated graph
 pancake sync   [top] [trunk]   fetch+prune, restack onto trunk, move every ref
 pancake submit [top] [trunk]   force-push (--force-with-lease) every branch
 pancake doctor                 check the GitHub prerequisites for stacked PRs
+pancake install                symlink git-stack/git-pancake so `git stack …` works
 
 Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --json  --trace[=json]
 ```
@@ -62,6 +63,21 @@ bottom → top — for scripting and for piping into other tools.
 any PR whose base isn't the branch directly below it — the misconfiguration you
 most want to catch in a stack. If `gh` is missing or unauthenticated it degrades
 to the plain decorated graph.
+
+## `git stack` — the native-feeling alias
+
+`pancake` is a mouthful to type. `pancake install` symlinks `git-stack` and
+`git-pancake` next to the binary, so git picks them up as subcommands:
+
+```sh
+pancake install          # one time (the binary's dir must be on PATH)
+git stack sync           # == pancake sync — auto-detects the top branch
+git stack submit
+git stack log
+```
+
+git runs `git-stack` for `git stack …`, and pancake ignores `argv[0]`, so the
+symlink is the whole trick — no wrapper, no extra process.
 
 ## Per-repo defaults: `.pancake`
 

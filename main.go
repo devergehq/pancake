@@ -302,13 +302,17 @@ func main() {
 		trunkSource = "flag"
 	}
 	top := fs.Arg(0)
-	if top == "" && cmd != "doctor" { // infer the tip of the stack from the graph
-		detected, derr := detectTop(o)
-		if derr != nil {
-			fatal("%v", derr)
+	switch cmd {
+	case "doctor", "install": // no <top> needed
+	default:
+		if top == "" { // infer the tip of the stack from the graph
+			detected, derr := detectTop(o)
+			if derr != nil {
+				fatal("%v", derr)
+			}
+			top = detected
+			note("auto-detected top branch: %s", top)
 		}
-		top = detected
-		note("auto-detected top branch: %s", top)
 	}
 
 	var err error
@@ -323,8 +327,10 @@ func main() {
 		err = cmdSubmit(top, o)
 	case "doctor":
 		err = cmdDoctor(o)
+	case "install":
+		err = cmdInstall(o)
 	default:
-		fatal("unknown command %q (try: list, log, sync, submit, doctor)", cmd)
+		fatal("unknown command %q (try: list, log, sync, submit, doctor, install)", cmd)
 	}
 	tr.finish()
 	if err != nil {
@@ -655,6 +661,46 @@ func cmdDoctor(o options) error {
 	return nil
 }
 
+// shimNames are the git-subcommand aliases install links to the pancake binary.
+// git resolves `git stack …` to an executable named `git-stack` on PATH, and
+// pancake ignores argv[0], so a symlink is all it takes — `git stack sync x`
+// runs pancake with cmd="sync". `git stack` is far nicer to type than `pancake`.
+var shimNames = []string{"git-stack", "git-pancake"}
+
+func cmdInstall(o options) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, e := filepath.EvalSymlinks(self); e == nil {
+		self = resolved
+	}
+	return installShims(self, filepath.Dir(self), o)
+}
+
+// installShims symlinks each shim name next to the pancake binary (already on
+// PATH if pancake is), so `git stack …` / `git pancake …` invoke pancake.
+func installShims(self, dir string, o options) error {
+	for _, name := range shimNames {
+		link := filepath.Join(dir, name)
+		if o.dryRun {
+			note("DRY-RUN: symlink %s -> %s", link, self)
+			continue
+		}
+		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("replace %s: %w", link, err)
+		}
+		if err := os.Symlink(self, link); err != nil {
+			return fmt.Errorf("symlink %s: %w", link, err)
+		}
+		note("linked %s -> %s", name, self)
+	}
+	if !o.dryRun {
+		note("done — `git stack <cmd>` now runs pancake (ensure %s is on PATH)", dir)
+	}
+	return nil
+}
+
 func cmdLog(top string, o options) error {
 	bs, err := stack(top, o)
 	if err != nil {
@@ -781,6 +827,7 @@ Usage:
   pancake sync   [flags] [top] [trunk]   fetch+prune, restack onto trunk, move all refs
   pancake submit [flags] [top] [trunk]   force-push (with lease) every branch in the stack
   pancake doctor [flags]                 check the GitHub prerequisites for stacked PRs
+  pancake install                        symlink git-stack/git-pancake so 'git stack ...' works
 
 Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)

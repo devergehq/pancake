@@ -1,5 +1,7 @@
 # Binaries
 /pancake
+/git-stack
+/git-pancake
 /dist/
 *.exe
 
