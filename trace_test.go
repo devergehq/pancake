@@ -128,11 +128,7 @@ func TestTraceRecordsRealGitCalls(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for _, c := range tc.calls {
-		phase := c.Cmd
-		if i := strings.IndexByte(phase, ' '); i > 0 {
-			phase = phase[:i]
-		}
-		seen[phase] = true
+		seen[gitPhase(c.Cmd)] = true
 	}
 	for _, want := range []string{"fetch", "rebase", "merge-base"} {
 		if !seen[want] {
