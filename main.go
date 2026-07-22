@@ -28,6 +28,12 @@ const (
 	defaultRemote = "origin"
 )
 
+// Populated at release time via -ldflags -X (see .goreleaser.yaml).
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 // Output streams. These are package-level seams so tests can capture command
 // output and streamed git I/O without spawning a subprocess. Production uses
 // the real terminal streams; nothing else reassigns them.
@@ -192,6 +198,9 @@ func main() {
 	switch cmd {
 	case "-h", "--help", "help":
 		usage(0)
+	case "-v", "--version", "version":
+		fmt.Fprintf(stdout, "pancake %s (%s)\n", version, commit)
+		return
 	}
 
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
