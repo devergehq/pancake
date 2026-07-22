@@ -172,6 +172,7 @@ type options struct {
 	remote  string
 	dryRun  bool
 	jsonOut bool
+	fix     bool
 }
 
 // branch is one member of the stack.
@@ -209,6 +210,7 @@ func main() {
 	fs.StringVar(&o.remote, "remote", defaultRemote, "remote name")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print mutating git commands instead of running them")
 	fs.BoolVar(&o.jsonOut, "json", false, "list: emit the stack as JSON")
+	fs.BoolVar(&o.fix, "fix", false, "doctor: enable delete_branch_on_merge on the repo")
 	var traceOpt traceMode
 	fs.Var(&traceOpt, "trace", "trace git calls with timings (--trace or --trace=json)")
 	_ = fs.Parse(os.Args[2:])
@@ -221,7 +223,7 @@ func main() {
 		o.trunk = t
 	}
 	top := fs.Arg(0)
-	if top == "" { // no <top> given — infer the tip of the stack from the graph
+	if top == "" && cmd != "doctor" { // infer the tip of the stack from the graph
 		detected, derr := detectTop(o)
 		if derr != nil {
 			fatal("%v", derr)
@@ -240,8 +242,10 @@ func main() {
 		err = cmdSync(top, o)
 	case "submit":
 		err = cmdSubmit(top, o)
+	case "doctor":
+		err = cmdDoctor(o)
 	default:
-		fatal("unknown command %q (try: list, log, sync, submit)", cmd)
+		fatal("unknown command %q (try: list, log, sync, submit, doctor)", cmd)
 	}
 	tr.finish()
 	if err != nil {
@@ -453,6 +457,106 @@ func ghFetchPRs(o options) (map[string]prInfo, error) {
 	return m, nil
 }
 
+// repoConfig is the subset of the origin repo's settings pancake cares about.
+type repoConfig struct {
+	NameWithOwner       string
+	DeleteBranchOnMerge bool
+	DefaultBranch       string
+}
+
+// Seams: production shells to gh; tests stub these.
+var (
+	fetchRepoConfig  = ghFetchRepoConfig
+	enableAutoDelete = ghEnableAutoDelete
+)
+
+func ghFetchRepoConfig(o options) (repoConfig, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return repoConfig{}, fmt.Errorf("gh not installed")
+	}
+	out, err := exec.Command("gh", "repo", "view",
+		"--json", "nameWithOwner,deleteBranchOnMerge,defaultBranchRef").Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return repoConfig{}, fmt.Errorf("gh: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return repoConfig{}, err
+	}
+	var raw struct {
+		NameWithOwner       string `json:"nameWithOwner"`
+		DeleteBranchOnMerge bool   `json:"deleteBranchOnMerge"`
+		DefaultBranchRef    struct {
+			Name string `json:"name"`
+		} `json:"defaultBranchRef"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return repoConfig{}, err
+	}
+	return repoConfig{
+		NameWithOwner:       raw.NameWithOwner,
+		DeleteBranchOnMerge: raw.DeleteBranchOnMerge,
+		DefaultBranch:       raw.DefaultBranchRef.Name,
+	}, nil
+}
+
+func ghEnableAutoDelete(o options, cfg repoConfig) error {
+	return exec.Command("gh", "api", "-X", "PATCH",
+		"repos/"+cfg.NameWithOwner, "-F", "delete_branch_on_merge=true").Run()
+}
+
+func check(pass bool, label, detail string) {
+	mark := "\033[32m✓\033[0m"
+	if !pass {
+		mark = "\033[31m✗\033[0m"
+	}
+	fmt.Fprintf(stdout, "  %s %-32s %s\n", mark, label, detail)
+}
+
+// cmdDoctor preflights the GitHub-side prerequisites for stacked PRs. The one
+// that silently rots a stack is delete_branch_on_merge: without it, GitHub never
+// retargets a stacked PR when its base merges.
+func cmdDoctor(o options) error {
+	cfg, err := fetchRepoConfig(o)
+	if err != nil {
+		check(false, "gh + repo access", err.Error())
+		return fmt.Errorf("doctor: cannot read repo config (is gh installed and authenticated?): %w", err)
+	}
+	check(true, "gh + repo access", cfg.NameWithOwner)
+
+	ok := true
+
+	if cfg.DeleteBranchOnMerge {
+		check(true, "auto-delete head branches", "enabled")
+	} else {
+		check(false, "auto-delete head branches", "DISABLED — stacked PRs won't retarget when a base merges")
+		if o.fix {
+			if err := enableAutoDelete(o, cfg); err != nil {
+				note("  --fix failed: %v", err)
+				ok = false
+			} else {
+				note("  fixed: enabled delete_branch_on_merge on %s", cfg.NameWithOwner)
+			}
+		} else {
+			ok = false
+			note("  fix: pancake doctor --fix   (or GitHub → Settings → General → \"Automatically delete head branches\")")
+		}
+	}
+
+	trunkShort := strings.TrimPrefix(o.trunk, o.remote+"/")
+	if cfg.DefaultBranch == "" || trunkShort == cfg.DefaultBranch {
+		check(true, "trunk matches default branch", trunkShort)
+	} else {
+		ok = false
+		check(false, "trunk vs default branch", fmt.Sprintf("trunk=%s but default=%s", trunkShort, cfg.DefaultBranch))
+	}
+
+	if !ok {
+		return fmt.Errorf("doctor found issues above")
+	}
+	note("doctor: all prerequisites satisfied")
+	return nil
+}
+
 func cmdLog(top string, o options) error {
 	bs, err := stack(top, o)
 	if err != nil {
@@ -548,6 +652,11 @@ func cmdSubmit(top string, o options) error {
 	if len(bs) == 0 {
 		return fmt.Errorf("no stack branches found above %s", o.trunk)
 	}
+	// Preflight: warn (don't block) if the repo won't auto-retarget the stack on
+	// merge. Silently skipped when gh is unavailable.
+	if cfg, err := fetchRepoConfig(o); err == nil && !cfg.DeleteBranchOnMerge {
+		note("! %s has auto-delete head branches OFF — stacked PRs won't retarget on merge (run: pancake doctor --fix)", cfg.NameWithOwner)
+	}
 	args := []string{"push", "--force-with-lease", o.remote}
 	names := make([]string, 0, len(bs))
 	for _, b := range bs {
@@ -573,12 +682,14 @@ Usage:
   pancake log    [flags] [top] [trunk]   decorated graph of the stack
   pancake sync   [flags] [top] [trunk]   fetch+prune, restack onto trunk, move all refs
   pancake submit [flags] [top] [trunk]   force-push (with lease) every branch in the stack
+  pancake doctor [flags]                 check the GitHub prerequisites for stacked PRs
 
 Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)
   --remote <name>  remote name (default origin)
   --dry-run        print mutating git commands instead of running them
   --json           list: emit the stack as JSON [{branch,sha,commitsAboveTrunk,subject}]
+  --fix            doctor: enable delete_branch_on_merge on the repo (needs gh)
   --trace[=json]   time every git call; end-of-run summary (or PANCAKE_TRACE=1)
 
 <top> is a short branch name, e.g. feature/dev-67 (no remote prefix). Omit it to

@@ -50,6 +50,7 @@ pancake list   [top] [trunk]   print the stack, bottom -> top
 pancake log    [top] [trunk]   PR-aware stack (via gh) + decorated graph
 pancake sync   [top] [trunk]   fetch+prune, restack onto trunk, move every ref
 pancake submit [top] [trunk]   force-push (--force-with-lease) every branch
+pancake doctor                 check the GitHub prerequisites for stacked PRs
 
 Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --json  --trace[=json]
 ```
@@ -61,6 +62,22 @@ bottom → top — for scripting and for piping into other tools.
 any PR whose base isn't the branch directly below it — the misconfiguration you
 most want to catch in a stack. If `gh` is missing or unauthenticated it degrades
 to the plain decorated graph.
+
+## Prerequisite: auto-delete head branches
+
+Stacked PRs on GitHub depend on one repo setting pancake cannot substitute for —
+**Settings → General → "Automatically delete head branches"** (`delete_branch_on_merge`).
+Without it, when a base PR merges, GitHub does **not** retarget the PR stacked
+above it: the merged branch lingers, the dependent PR keeps the wrong base, and
+the stack silently rots. pancake won't flip org settings for you, but it will
+tell you when it's off:
+
+```sh
+pancake doctor          # ✓/✗ gh auth, delete_branch_on_merge, trunk == default branch
+pancake doctor --fix    # enable delete_branch_on_merge for you (via gh)
+```
+
+`submit` also warns if the setting is off.
 
 Omit `[top]` and pancake infers it: the tip of your stack (the unmerged branch
 nothing else is built on). With one stack that's unambiguous; with several it
