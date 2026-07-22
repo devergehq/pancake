@@ -39,9 +39,27 @@ Four git plumbing calls behind a nice UX:
 - **restack** → `git rebase --update-refs --onto <trunk> <fork>`
 - **submit** → `git push --force-with-lease`
 
-Because `sync` rebases from the fork point onto the latest trunk, any commit
-already contained in trunk (i.e. whatever just merged) replays empty and is
-dropped — so you never have to tell it which branch merged.
+Because `sync` rebases onto the latest trunk, any commit already contained in
+trunk (i.e. whatever just merged) replays empty and is dropped — so you never
+have to tell it which branch merged.
+
+### Squash-merges of multi-commit branches
+
+Squash-merging a **single-commit** branch is trivial: it drops as an empty replay.
+A **multi-commit** branch is the tricky case — its N commits collapse into one
+commit on trunk, so naively replaying the individual N conflicts. `sync` finds
+the boundary and starts the replay *above* the squashed branch automatically:
+
+1. via the merged branch's leftover **local ref** (git prunes only the remote), and
+2. failing that, via **patch-id** — a squash commit shares its patch-id with the
+   range it collapsed, so it works even in a fresh clone with no local ref.
+
+If a squash can't be matched (e.g. conflict resolution was baked into the merge),
+`sync` tells you and you name the boundary explicitly:
+
+```sh
+pancake sync feature/top --from <the squash-merged branch's pre-merge tip>
+```
 
 ## Commands
 
