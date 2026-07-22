@@ -63,6 +63,29 @@ any PR whose base isn't the branch directly below it — the misconfiguration yo
 most want to catch in a stack. If `gh` is missing or unauthenticated it degrades
 to the plain decorated graph.
 
+## Per-repo defaults: `.pancake`
+
+pancake defaults its trunk to `origin/master`, but plenty of repos default to
+`main`, `dev`, or `develop` — and stacking onto the wrong branch is a silent,
+maddening failure. Rather than pass `--trunk` every time, commit an optional
+`.pancake` file at the repo root:
+
+```ini
+# .pancake — pancake defaults for this repo
+trunk  = origin/dev
+remote = origin
+```
+
+- **Precedence:** `--trunk` (flag/positional) → `.pancake` → built-in `origin/master`.
+- It's committed and versioned, so a fresh or ephemeral clone gets the right
+  default from the first second. It configures the *default target only* — the
+  stack itself is still derived from the graph, so this doesn't touch the
+  stateless contract.
+- `pancake doctor` shows where the trunk came from and, if you *didn't* configure
+  one, warns when pancake's built-in default doesn't match the repo's default
+  branch (the real trap). A deliberate override is reported as intentional, not
+  an error.
+
 ## Prerequisite: auto-delete head branches
 
 Stacked PRs on GitHub depend on one repo setting pancake cannot substitute for —

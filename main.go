@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,67 @@ var (
 	stdout io.Writer = os.Stdout
 	stderr io.Writer = os.Stderr
 )
+
+// fileConfig holds the optional per-repo defaults read from a .pancake file.
+type fileConfig struct {
+	trunk   string
+	remote  string
+	path    string   // where it was found ("" if none)
+	unknown []string // unrecognized keys, surfaced by doctor
+}
+
+// localConfig is the .pancake resolved at startup; trunkSource records where the
+// effective trunk came from ("default" | "config" | "flag"), for doctor.
+var (
+	localConfig fileConfig
+	trunkSource = "default"
+)
+
+// configFile is the per-repo config filename, read from the repo root.
+const configFile = ".pancake"
+
+// loadConfig reads dir/.pancake if present. A missing file is not an error —
+// pancake just uses its built-in defaults.
+func loadConfig(dir string) fileConfig {
+	fc := fileConfig{}
+	if dir == "" {
+		return fc
+	}
+	path := filepath.Join(dir, configFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fc
+	}
+	fc.path = path
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key := strings.TrimSpace(k); key {
+		case "trunk":
+			fc.trunk = strings.TrimSpace(v)
+		case "remote":
+			fc.remote = strings.TrimSpace(v)
+		default:
+			fc.unknown = append(fc.unknown, key)
+		}
+	}
+	return fc
+}
+
+// repoRoot returns the top-level directory of the current git repo, or "".
+func repoRoot() string {
+	out, err := git("rev-parse", "--show-toplevel")
+	if err != nil {
+		return ""
+	}
+	return out
+}
 
 // tr is the active tracer, or nil when tracing is off. It is package-level so
 // the bare git() helper (which takes no options) can feed it. Because pancake
@@ -204,10 +266,21 @@ func main() {
 		return
 	}
 
+	// Per-repo defaults from .pancake feed the flag defaults, so an explicit flag
+	// still overrides the file, which overrides the built-in default.
+	localConfig = loadConfig(repoRoot())
+	trunkDefault, remoteDefault := defaultTrunk, defaultRemote
+	if localConfig.trunk != "" {
+		trunkDefault, trunkSource = localConfig.trunk, "config"
+	}
+	if localConfig.remote != "" {
+		remoteDefault = localConfig.remote
+	}
+
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	var o options
-	fs.StringVar(&o.trunk, "trunk", defaultTrunk, "trunk branch the stack targets")
-	fs.StringVar(&o.remote, "remote", defaultRemote, "remote name")
+	fs.StringVar(&o.trunk, "trunk", trunkDefault, "trunk branch the stack targets")
+	fs.StringVar(&o.remote, "remote", remoteDefault, "remote name")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print mutating git commands instead of running them")
 	fs.BoolVar(&o.jsonOut, "json", false, "list: emit the stack as JSON")
 	fs.BoolVar(&o.fix, "fix", false, "doctor: enable delete_branch_on_merge on the repo")
@@ -219,8 +292,14 @@ func main() {
 		tr = &tracer{mode: mode}
 	}
 
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "trunk" {
+			trunkSource = "flag"
+		}
+	})
 	if t := fs.Arg(1); t != "" { // optional positional trunk override
 		o.trunk = t
+		trunkSource = "flag"
 	}
 	top := fs.Arg(0)
 	if top == "" && cmd != "doctor" { // infer the tip of the stack from the graph
@@ -516,6 +595,19 @@ func check(pass bool, label, detail string) {
 // that silently rots a stack is delete_branch_on_merge: without it, GitHub never
 // retargets a stacked PR when its base merges.
 func cmdDoctor(o options) error {
+	// Where the trunk came from, so it's clear whether pancake guessed or you chose.
+	switch trunkSource {
+	case "config":
+		check(true, "trunk source", fmt.Sprintf("%s → %s", configFile, o.trunk))
+	case "flag":
+		check(true, "trunk source", fmt.Sprintf("--trunk → %s", o.trunk))
+	default:
+		check(true, "trunk source", fmt.Sprintf("built-in default → %s", o.trunk))
+	}
+	for _, k := range localConfig.unknown {
+		note("  ignoring unknown %s key %q", configFile, k)
+	}
+
 	cfg, err := fetchRepoConfig(o)
 	if err != nil {
 		check(false, "gh + repo access", err.Error())
@@ -543,11 +635,17 @@ func cmdDoctor(o options) error {
 	}
 
 	trunkShort := strings.TrimPrefix(o.trunk, o.remote+"/")
-	if cfg.DefaultBranch == "" || trunkShort == cfg.DefaultBranch {
-		check(true, "trunk matches default branch", trunkShort)
-	} else {
+	switch {
+	case cfg.DefaultBranch == "" || trunkShort == cfg.DefaultBranch:
+		check(true, "trunk vs repo default", trunkShort)
+	case trunkSource != "default":
+		// You deliberately chose a trunk other than the repo default — fine.
+		check(true, "trunk vs repo default", fmt.Sprintf("%s (intentional; repo default is %s)", trunkShort, cfg.DefaultBranch))
+	default:
+		// pancake fell back to its built-in default but the repo's default differs
+		// — the silent-wrong-target trap. This is the one worth flagging.
 		ok = false
-		check(false, "trunk vs default branch", fmt.Sprintf("trunk=%s but default=%s", trunkShort, cfg.DefaultBranch))
+		check(false, "trunk vs repo default", fmt.Sprintf("pancake defaulted to %s but repo default is %s — set trunk in %s or use --trunk", trunkShort, cfg.DefaultBranch, configFile))
 	}
 
 	if !ok {
@@ -694,6 +792,11 @@ Flags (must precede positional args):
 
 <top> is a short branch name, e.g. feature/dev-67 (no remote prefix). Omit it to
 auto-detect the tip of your stack from the graph (the current branch's stack).
+
+Per-repo defaults: commit a .pancake file at the repo root to change the trunk
+without passing --trunk every time (precedence: --trunk > .pancake > origin/master):
+  trunk  = origin/dev
+  remote = origin
 
 Since pancake is a thin wrapper over git, --trace shows exactly where a run's
 time goes — set GIT_TRACE2=1 alongside it to see git's own internal phases.
