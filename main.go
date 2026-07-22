@@ -410,14 +410,28 @@ func stack(top string, o options) ([]branch, error) {
 	return bs, nil
 }
 
-// detectTop infers the top branch when the user omits it: among the remote
-// branches not merged into trunk, the "tip" of a stack is one that no other
-// such branch is built on top of. With a single stack there is exactly one tip.
-// With several independent stacks, it disambiguates by the current branch —
-// the tip whose stack contains HEAD — and otherwise asks the user to be
-// explicit rather than guessing.
+// detectTop infers the top branch when the user omits it, anchored on the
+// current branch — the stack you're working on. It scopes the search to the
+// branches that build on the current branch (a single `for-each-ref --contains`)
+// and returns the tip of that small set. Crucially it never sweeps every ref in
+// the repo: on a repo with thousands of branches the old pairwise approach fired
+// O(branches^2) `merge-base` calls and took minutes (see DEV-245).
 func detectTop(o options) (string, error) {
-	out, err := git("for-each-ref", "--no-merged", o.trunk,
+	cur, err := git("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || cur == "" || cur == "HEAD" {
+		return "", fmt.Errorf("not on a branch — pass <top> explicitly")
+	}
+	if cur == strings.TrimPrefix(o.trunk, o.remote+"/") {
+		return "", fmt.Errorf("on the trunk (%s) — checkout your stack or pass <top> explicitly", cur)
+	}
+	curRef := o.remote + "/" + cur
+	if _, err := git("rev-parse", "--verify", "--quiet", curRef); err != nil {
+		return "", fmt.Errorf("current branch %q has no %s — push it, or pass <top> explicitly", cur, curRef)
+	}
+
+	// Branches at or above the current one in its stack: those that contain it and
+	// aren't already in trunk. One ref scan, scoped to this stack — not the repo.
+	out, err := git("for-each-ref", "--contains", curRef, "--no-merged", o.trunk,
 		"--format=%(refname:lstrip=3)", "refs/remotes/"+o.remote+"/")
 	if err != nil {
 		return "", err
@@ -430,12 +444,9 @@ func detectTop(o options) (string, error) {
 		}
 		cands = append(cands, l)
 	}
-	if len(cands) == 0 {
-		return "", fmt.Errorf("no branches above %s to infer a stack from — pass <top> explicitly", o.trunk)
-	}
 
-	// A candidate is a tip if no other candidate contains it.
-	var tips []string
+	// The tip is the candidate that no other candidate builds on. This set is the
+	// size of the stack (a handful), so the pairwise check here is cheap.
 	for _, x := range cands {
 		isTip := true
 		for _, y := range cands {
@@ -445,27 +456,10 @@ func detectTop(o options) (string, error) {
 			}
 		}
 		if isTip {
-			tips = append(tips, x)
+			return x, nil
 		}
 	}
-	if len(tips) == 1 {
-		return tips[0], nil
-	}
-
-	// Multiple stacks: pick the one whose tip contains the current branch.
-	if cur, err := git("rev-parse", "--abbrev-ref", "HEAD"); err == nil && cur != "" && cur != "HEAD" {
-		var match []string
-		for _, tp := range tips {
-			if tp == cur || contains(o.remote+"/"+tp, o.remote+"/"+cur) {
-				match = append(match, tp)
-			}
-		}
-		if len(match) == 1 {
-			return match[0], nil
-		}
-	}
-	sort.Strings(tips)
-	return "", fmt.Errorf("multiple stacks found (%s) — pass <top> explicitly", strings.Join(tips, ", "))
+	return cur, nil // current branch is the tip (nothing builds on it yet)
 }
 
 // contains reports whether ref outer contains inner (inner is an ancestor of
