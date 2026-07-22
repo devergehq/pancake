@@ -47,7 +47,7 @@ dropped — so you never have to tell it which branch merged.
 
 ```
 pancake list   [top] [trunk]   print the stack, bottom -> top
-pancake log    [top] [trunk]   decorated graph of the stack
+pancake log    [top] [trunk]   PR-aware stack (via gh) + decorated graph
 pancake sync   [top] [trunk]   fetch+prune, restack onto trunk, move every ref
 pancake submit [top] [trunk]   force-push (--force-with-lease) every branch
 
@@ -56,6 +56,11 @@ Flags (before positionals): --trunk <ref>  --remote <name>  --dry-run  --json  -
 
 `list --json` emits `[{branch, sha, commitsAboveTrunk, subject}]`, ordered
 bottom → top — for scripting and for piping into other tools.
+
+`log` annotates each branch with its PR number/state/base (via `gh`) and flags
+any PR whose base isn't the branch directly below it — the misconfiguration you
+most want to catch in a stack. If `gh` is missing or unauthenticated it degrades
+to the plain decorated graph.
 
 Omit `[top]` and pancake infers it: the tip of your stack (the unmerged branch
 nothing else is built on). With one stack that's unambiguous; with several it
