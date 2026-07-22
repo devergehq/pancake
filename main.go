@@ -152,17 +152,27 @@ func (t *tracer) record(args []string, d time.Duration, err error, mutating, ski
 	}
 }
 
+// gitPhase is the git subcommand a traced call belongs to, skipping any leading
+// `-c key=val` config prefixes (e.g. `-c core.hooksPath=… rebase` -> "rebase").
+func gitPhase(cmd string) string {
+	fields := strings.Fields(cmd)
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "-c" {
+			i++ // skip the config value
+			continue
+		}
+		return fields[i]
+	}
+	return ""
+}
+
 // stats aggregates the recorded calls: total wall-clock spent in git, the call
 // count, and the slowest git subcommand (by summed duration).
 func (t *tracer) stats() (total int64, count int, slowPhase string, slowMS int64) {
 	byPhase := map[string]int64{}
 	for _, c := range t.calls {
 		total += c.MS
-		phase := c.Cmd
-		if i := strings.IndexByte(phase, ' '); i > 0 {
-			phase = phase[:i]
-		}
-		byPhase[phase] += c.MS
+		byPhase[gitPhase(c.Cmd)] += c.MS
 	}
 	slowMS = -1
 	for p, ms := range byPhase {
@@ -778,7 +788,7 @@ func cmdSync(top string, o options) error {
 	if err != nil {
 		return err
 	}
-	note("restacking %d branches onto %s (from %s)", len(bs), o.trunk, short(boundary))
+	note("restacking %d branches onto %s (from %s; hooks skipped)", len(bs), o.trunk, short(boundary))
 	if err := restackSegmented(bs, boundary, o); err != nil {
 		return err
 	}
@@ -809,7 +819,11 @@ func restackSegmented(bs []branch, boundary string, o options) error {
 	base, upstream := o.trunk, boundary
 	for _, b := range bs {
 		note("  %s onto %s", b.name, base)
-		if err := run(o, true, "rebase", "--onto", base, upstream, b.name); err != nil {
+		// core.hooksPath=/dev/null disables repo hooks for the rebase. A restack
+		// only re-applies existing commits; re-running commit hooks (e.g. a slow
+		// prepare-commit-msg that stamps a ticket id) is wrong and, on a real repo,
+		// was the entire cost — ~29s per replayed commit.
+		if err := run(o, true, "-c", "core.hooksPath="+os.DevNull, "rebase", "--onto", base, upstream, b.name); err != nil {
 			note("restack conflicted on %s — if a multi-commit branch was squash-merged and pancake", b.name)
 			note("couldn't detect the boundary, re-run with --from <its pre-merge tip>")
 			return err

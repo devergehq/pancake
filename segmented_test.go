@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,5 +49,31 @@ func TestSyncSegmentedPreservesMultiCommitBranch(t *testing.T) {
 	// feature/b still owns exactly its two commits above feature/a.
 	if n := r.git("rev-list", "--count", "feature/a..feature/b"); n != "2" {
 		t.Errorf("feature/b has %s commits above feature/a, want 2", n)
+	}
+}
+
+// The restack must NOT run repo commit hooks — re-running them on already-authored
+// commits is wrong and, on a real repo, was the whole perf cost (a slow
+// prepare-commit-msg firing per replayed commit).
+func TestSyncDoesNotRunCommitHooks(t *testing.T) {
+	r := newRepo(t)
+	r.buildStack()
+	r.switchTo("master")
+	r.writeCommit("m.txt", "m", "master moved")
+	r.git("push", "origin", "master")
+
+	// Install the hook AFTER the stack is built, so only the restack could fire it.
+	marker := filepath.Join(r.dir, ".git", "HOOK_RAN")
+	hook := filepath.Join(r.dir, ".git", "hooks", "prepare-commit-msg")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(r.dir)
+
+	if err := cmdSync("feature/c", opts()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("prepare-commit-msg ran during the restack — hooks must be disabled")
 	}
 }
