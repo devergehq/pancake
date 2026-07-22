@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -235,6 +236,7 @@ type options struct {
 	dryRun  bool
 	jsonOut bool
 	fix     bool
+	from    string // sync: explicit restack boundary (overrides auto-detection)
 }
 
 // branch is one member of the stack.
@@ -284,6 +286,7 @@ func main() {
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print mutating git commands instead of running them")
 	fs.BoolVar(&o.jsonOut, "json", false, "list: emit the stack as JSON")
 	fs.BoolVar(&o.fix, "fix", false, "doctor: enable delete_branch_on_merge on the repo")
+	fs.StringVar(&o.from, "from", "", "sync: start the restack from <ref> (squash-merge boundary escape hatch)")
 	var traceOpt traceMode
 	fs.Var(&traceOpt, "trace", "trace git calls with timings (--trace or --trace=json)")
 	_ = fs.Parse(os.Args[2:])
@@ -766,20 +769,152 @@ func cmdSync(top string, o options) error {
 			note("! skipped %s (checked out in another worktree — align it there)", b.name)
 		}
 	}
-	// Fork point on the (remote) top so it works even under --dry-run.
-	fork, err := git("merge-base", o.trunk, o.remote+"/"+top)
+	// Where to start the replay. Normally the fork point — a single squash-merged
+	// commit already in trunk drops as an empty replay. But a MULTI-commit branch
+	// that was squash-merged collapses to one commit in trunk, so replaying its
+	// individual commits conflicts (add/add). restackFrom finds the boundary that
+	// starts ABOVE such a merged branch, skipping its commits.
+	boundary, err := restackFrom(top, o)
 	if err != nil {
 		return err
 	}
-	// Replay onto the new trunk. Commits already contained in trunk (whatever
-	// just merged) replay empty and are dropped, so the merged branch never has
-	// to be named. --update-refs carries every local branch to its new position.
-	note("restacking %s onto %s (--update-refs)", top, o.trunk)
-	if err := run(o, true, "rebase", "--update-refs", "--onto", o.trunk, fork); err != nil {
+	note("restacking %s onto %s from %s (--update-refs)", top, o.trunk, short(boundary))
+	if err := run(o, true, "rebase", "--update-refs", "--onto", o.trunk, boundary); err != nil {
+		note("restack conflicted — if a multi-commit branch was squash-merged and pancake couldn't")
+		note("detect the boundary, re-run with --from <that branch's pre-merge tip> (or a SHA off the merged PR)")
 		return err
 	}
 	note("done — review with: pancake log %s", top)
 	return nil
+}
+
+func short(sha string) string {
+	if len(sha) > 10 {
+		return sha[:10]
+	}
+	return sha
+}
+
+// restackFrom decides where sync starts the replay, handling squash-merged
+// branches. In priority order:
+//
+//  1. --from <ref>: explicit, trust it.
+//  2. local ref: when a branch is squash-merged and deleted upstream, git prunes
+//     only the REMOTE ref — the local branch stays. The highest local branch with
+//     no remote counterpart that is an ancestor of top is exactly the boundary
+//     (works when you sync on the machine you merged from).
+//  3. patch-id: stateless. A squash commit on trunk has the same patch-id as the
+//     cumulative diff of the range it collapsed, so we can find the boundary with
+//     no local ref at all (works in a fresh clone).
+//
+// Falls back to the fork point when nothing merged.
+func restackFrom(top string, o options) (string, error) {
+	fork, err := git("merge-base", o.trunk, o.remote+"/"+top)
+	if err != nil {
+		return "", err
+	}
+	if o.from != "" {
+		b, err := git("rev-parse", "--verify", o.from+"^{commit}")
+		if err != nil {
+			return "", fmt.Errorf("--from: %q is not a valid commit/ref", o.from)
+		}
+		note("using explicit boundary --from %s (%s)", o.from, short(b))
+		return b, nil
+	}
+	if lb, ok := localMergedBoundary(top, o, fork); ok {
+		return lb, nil
+	}
+	if pb, ok := patchIDBoundary(top, o, fork); ok {
+		return pb, nil
+	}
+	return fork, nil
+}
+
+// localMergedBoundary raises the boundary to the highest local branch that has
+// no remote counterpart (merged + pruned) and is an ancestor of top.
+func localMergedBoundary(top string, o options, fork string) (string, bool) {
+	out, err := git("for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads/")
+	if err != nil {
+		return "", false
+	}
+	boundary, raised := fork, false
+	for _, lb := range strings.Split(out, "\n") {
+		lb = strings.TrimSpace(lb)
+		if lb == "" || lb == top {
+			continue
+		}
+		if _, err := git("rev-parse", "--verify", "--quiet", o.remote+"/"+lb); err == nil {
+			continue // still on the remote — not merged/pruned
+		}
+		if !contains(o.remote+"/"+top, lb) {
+			continue // not part of this stack
+		}
+		if contains(lb, boundary) { // lb is higher than the current boundary
+			if sha, err := git("rev-parse", lb); err == nil {
+				boundary, raised = sha, true
+				note("squash-merged branch below the stack: %s — skipping its commits", lb)
+			}
+		}
+	}
+	return boundary, raised
+}
+
+// patchIDBoundary finds the boundary with no local ref: a squash commit on trunk
+// shares a patch-id with the cumulative diff of the stack range it collapsed.
+func patchIDBoundary(top string, o options, fork string) (string, bool) {
+	newTrunk, err := git("rev-list", fork+".."+o.trunk)
+	if err != nil || newTrunk == "" {
+		return "", false // trunk didn't move — nothing merged
+	}
+	squashes := strings.Fields(newTrunk)
+	const maxScan = 200
+	if len(squashes) > maxScan {
+		note("squash scan: trunk gained %d commits; checking the %d most recent", len(squashes), maxScan)
+		squashes = squashes[:maxScan]
+	}
+	byPID := map[string]bool{}
+	for _, s := range squashes {
+		if pid, ok := patchID(s+"^", s); ok {
+			byPID[pid] = true
+		}
+	}
+	if len(byPID) == 0 {
+		return "", false
+	}
+	commits, err := git("rev-list", "--reverse", fork+".."+o.remote+"/"+top)
+	if err != nil {
+		return "", false
+	}
+	best := ""
+	for _, c := range strings.Fields(commits) {
+		if pid, ok := patchID(fork, c); ok && byPID[pid] {
+			best = c // highest cumulative range whose diff is already upstream
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	note("squash boundary detected via patch-id at %s — skipping already-merged commits", short(best))
+	return best, true
+}
+
+// patchID returns the git patch-id of the diff produced by `git diff <args>`.
+func patchID(args ...string) (string, bool) {
+	out, err := exec.Command("git", append([]string{"diff"}, args...)...).Output()
+	if err != nil || len(out) == 0 {
+		return "", false
+	}
+	pid := exec.Command("git", "patch-id", "--stable")
+	pid.Stdin = bytes.NewReader(out)
+	res, err := pid.Output()
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(res))
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
 }
 
 func cmdSubmit(top string, o options) error {
@@ -827,6 +962,7 @@ Flags (must precede positional args):
   --trunk <ref>    trunk the stack targets (default origin/master)
   --remote <name>  remote name (default origin)
   --dry-run        print mutating git commands instead of running them
+  --from <ref>     sync: start the restack here (squash-merge boundary escape hatch)
   --json           list: emit the stack as JSON [{branch,sha,commitsAboveTrunk,subject}]
   --fix            doctor: enable delete_branch_on_merge on the repo (needs gh)
   --trace[=json]   time every git call; end-of-run summary (or PANCAKE_TRACE=1)
