@@ -778,13 +778,46 @@ func cmdSync(top string, o options) error {
 	if err != nil {
 		return err
 	}
-	note("restacking %s onto %s from %s (--update-refs)", top, o.trunk, short(boundary))
-	if err := run(o, true, "rebase", "--update-refs", "--onto", o.trunk, boundary); err != nil {
-		note("restack conflicted — if a multi-commit branch was squash-merged and pancake couldn't")
-		note("detect the boundary, re-run with --from <that branch's pre-merge tip> (or a SHA off the merged PR)")
+	note("restacking %d branches onto %s (from %s)", len(bs), o.trunk, short(boundary))
+	if err := restackSegmented(bs, boundary, o); err != nil {
 		return err
 	}
 	note("done — review with: pancake log %s", top)
+	return nil
+}
+
+// restackSegmented replays the stack one branch at a time with PLAIN rebases,
+// instead of a single `rebase --update-refs`. On repos with thousands of refs
+// --update-refs is pathologically slow — it reconciles every ref in the repo
+// (observed: ~110s to move a handful of commits). A plain rebase touches only
+// the branch it moves, so this is O(stack) fast rebases.
+//
+// Each branch is rebased onto the PREVIOUS branch's new position, using its own
+// ORIGINAL parent tip as the range's lower bound — so a branch carries ALL of
+// its commits, however many. The bottom branch starts from the squash boundary,
+// so already-merged commits below it are never replayed.
+func restackSegmented(bs []branch, boundary string, o options) error {
+	// Snapshot original tips before anything moves — they bound each segment.
+	oldTip := make(map[string]string, len(bs))
+	for _, b := range bs {
+		sha, err := git("rev-parse", b.name)
+		if err != nil {
+			return err
+		}
+		oldTip[b.name] = sha
+	}
+	base, upstream := o.trunk, boundary
+	for _, b := range bs {
+		note("  %s onto %s", b.name, base)
+		if err := run(o, true, "rebase", "--onto", base, upstream, b.name); err != nil {
+			note("restack conflicted on %s — if a multi-commit branch was squash-merged and pancake", b.name)
+			note("couldn't detect the boundary, re-run with --from <its pre-merge tip>")
+			return err
+		}
+		// The branch ref now points at its new tip, so it is the base for the next
+		// branch; that next branch's commits sit above THIS branch's old tip.
+		base, upstream = b.name, oldTip[b.name]
+	}
 	return nil
 }
 
